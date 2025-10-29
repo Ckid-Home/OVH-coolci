@@ -31,6 +31,10 @@ class ServerMonitor:
         self.check_interval = 60  # 检查间隔（秒），默认60秒
         self.thread = None
         
+        # 价格缓存：key = f"{plan_code}|{sorted_options}"，value = {"price": str, "timestamp": float}
+        self.price_cache = {}
+        self.price_cache_ttl = 3 * 24 * 3600  # 缓存有效期：3天（秒）
+        
         self.add_log("INFO", "服务器监控器初始化完成", "monitor")
     
     def add_subscription(self, plan_code, datacenters=None, notify_available=True, notify_unavailable=False, server_name=None, last_status=None, history=None):
@@ -145,7 +149,16 @@ class ServerMonitor:
                     
                     self.add_log("INFO", f"检查配置: {config_display}", "monitor")
                     
-                    # 检查该配置在各个数据中心的可用性
+                    # 准备配置信息
+                    config_info = {
+                        "memory": memory,
+                        "storage": storage,
+                        "display": config_display,
+                        "options": config_data.get("options", [])  # 包含API2格式的选项代码
+                    }
+                    
+                    # 先收集所有需要发送通知的数据中心
+                    notifications_to_send = []
                     for dc, status in config_data["datacenters"].items():
                         # 如果指定了数据中心列表，只监控列表中的
                         if monitored_dcs and dc not in monitored_dcs:
@@ -155,15 +168,120 @@ class ServerMonitor:
                         status_key = f"{dc}|{config_key}"
                         old_status = last_status.get(status_key)
                         
-                        # 准备配置信息用于通知
-                        config_info = {
-                            "memory": memory,
-                            "storage": storage,
-                            "display": config_display,
-                            "options": config_data.get("options", [])  # 包含API2格式的选项代码
+                        # 检查是否需要发送通知（只在状态变化时通知）
+                        status_changed = False
+                        change_type = None
+                        
+                        # 首次检查时不发送通知，只记录状态
+                        if old_status is None:
+                            config_desc = f" [{config_display}]" if config_display else ""
+                            if status == "unavailable":
+                                self.add_log("INFO", f"首次检查: {plan_code}@{dc}{config_desc} 无货", "monitor")
+                            else:
+                                self.add_log("INFO", f"首次检查: {plan_code}@{dc}{config_desc} 有货（状态: {status}），不发送通知", "monitor")
+                        # 从无货变有货
+                        elif old_status == "unavailable" and status != "unavailable":
+                            if subscription.get("notifyAvailable", True):
+                                status_changed = True
+                                change_type = "available"
+                                config_desc = f" [{config_display}]" if config_display else ""
+                                self.add_log("INFO", f"{plan_code}@{dc}{config_desc} 从无货变有货（状态: {status}）", "monitor")
+                        # 从有货变无货
+                        elif old_status not in ["unavailable", None] and status == "unavailable":
+                            if subscription.get("notifyUnavailable", False):
+                                status_changed = True
+                                change_type = "unavailable"
+                                config_desc = f" [{config_display}]" if config_display else ""
+                                self.add_log("INFO", f"{plan_code}@{dc}{config_desc} 从有货变无货", "monitor")
+                        
+                        if status_changed:
+                            notifications_to_send.append({
+                                "dc": dc,
+                                "status": status,
+                                "old_status": old_status,
+                                "status_key": status_key,
+                                "change_type": change_type
+                            })
+                    
+                    # 对于同一个配置，只查询一次价格（使用第一个有货的数据中心）
+                    price_text = None
+                    if notifications_to_send:
+                        # 找出第一个有货的数据中心用于价格查询
+                        first_available_dc = None
+                        for notif in notifications_to_send:
+                            if notif["change_type"] == "available" and notif["status"] != "unavailable":
+                                first_available_dc = notif["dc"]
+                                break
+                        
+                        # 如果有有货的数据中心，查询价格
+                        if first_available_dc:
+                            try:
+                                import threading
+                                import queue
+                                price_queue = queue.Queue()
+                                
+                                def fetch_price():
+                                    try:
+                                        price_result = self._get_price_info(plan_code, first_available_dc, config_info)
+                                        price_queue.put(price_result)
+                                    except Exception as e:
+                                        self.add_log("WARNING", f"价格获取线程异常: {str(e)}", "monitor")
+                                        price_queue.put(None)
+                                
+                                # 启动价格获取线程
+                                price_thread = threading.Thread(target=fetch_price, daemon=True)
+                                price_thread.start()
+                                price_thread.join(timeout=30.0)  # 最多等待30秒
+                                
+                                if price_thread.is_alive():
+                                    self.add_log("WARNING", f"价格获取超时（30秒），发送不带价格的通知", "monitor")
+                                else:
+                                    try:
+                                        price_text = price_queue.get_nowait()
+                                    except queue.Empty:
+                                        pass
+                                
+                                if price_text:
+                                    self.add_log("DEBUG", f"配置 {config_display} 价格获取成功: {price_text}，将在所有通知中复用", "monitor")
+                                else:
+                                    self.add_log("WARNING", f"配置 {config_display} 价格获取失败，通知中不包含价格信息", "monitor")
+                            except Exception as e:
+                                self.add_log("WARNING", f"价格获取过程异常: {str(e)}", "monitor")
+                    
+                    # 发送所有通知（复用同一个价格）
+                    for notif in notifications_to_send:
+                        config_desc = f" [{config_info['display']}]" if config_info else ""
+                        self.add_log("INFO", f"准备发送提醒: {plan_code}@{notif['dc']}{config_desc} - {notif['change_type']}", "monitor")
+                        server_name = subscription.get("serverName")
+                        
+                        # 创建包含价格的配置信息副本
+                        config_info_with_price = config_info.copy() if config_info else None
+                        if config_info_with_price:
+                            config_info_with_price["cached_price"] = price_text  # 传递缓存的价格
+                        
+                        self.send_availability_alert(plan_code, notif["dc"], notif["status"], notif["change_type"], 
+                                                    config_info_with_price, server_name)
+                        
+                        # 添加到历史记录
+                        if "history" not in subscription:
+                            subscription["history"] = []
+                        
+                        history_entry = {
+                            "timestamp": datetime.now().isoformat(),
+                            "datacenter": notif["dc"],
+                            "status": notif["status"],
+                            "changeType": notif["change_type"],
+                            "oldStatus": notif["old_status"]
                         }
                         
-                        self._check_and_notify_change(subscription, plan_code, dc, status, old_status, config_info, status_key)
+                        if config_info:
+                            history_entry["config"] = config_info
+                        
+                        subscription["history"].append(history_entry)
+                        
+                        # 限制历史记录数量
+                        if len(subscription["history"]) > 100:
+                            subscription["history"] = subscription["history"][-100:]
             
             # 更新状态（需要转换为状态字典）
             new_last_status = {}
@@ -196,24 +314,17 @@ class ServerMonitor:
             config_info: 配置信息 {"memory": "xxx", "storage": "xxx", "display": "xxx"}
             status_key: 状态键（用于lastStatus）
         """
-        # 状态变化检测
+        # 状态变化检测（只在状态变化时通知，首次检查不通知）
         status_changed = False
         change_type = None
         
-        # 首次检查（old_status为None）且服务器可用
-        # 默认启用首次检查通知
-        if old_status is None and status != "unavailable":
-            notify_first_check = subscription.get("notifyFirstCheck", True)  # 默认通知首次检查
-            if notify_first_check and subscription.get("notifyAvailable", True):
-                status_changed = True
-                change_type = "available"
-                config_desc = f" [{config_info['display']}]" if config_info else ""
-                self.add_log("INFO", f"首次检查发现 {plan_code}@{dc}{config_desc} 有货", "monitor")
+        # 首次检查时不发送通知，只记录状态
+        if old_status is None:
+            config_desc = f" [{config_info['display']}]" if config_info else ""
+            if status == "unavailable":
+                self.add_log("INFO", f"首次检查: {plan_code}@{dc}{config_desc} 无货", "monitor")
             else:
-                # 记录首次检查结果但不发送通知
-                config_desc = f" [{config_info['display']}]" if config_info else ""
-                self.add_log("INFO", f"首次检查发现 {plan_code}@{dc}{config_desc} 有货（已禁用首次检查通知）", "monitor")
-        
+                self.add_log("INFO", f"首次检查: {plan_code}@{dc}{config_desc} 有货（状态: {status}），不发送通知", "monitor")
         # 从无货变有货
         elif old_status == "unavailable" and status != "unavailable":
             if subscription.get("notifyAvailable", True):
@@ -292,46 +403,57 @@ class ServerMonitor:
                         f"└─ 存储: {config_info['storage']}\n"
                     )
                 
-                # 异步获取价格信息（带30秒超时）
+                # 获取价格信息（优先使用缓存的价格）
                 price_text = None
-                try:
-                    import threading
-                    import queue
-                    price_queue = queue.Queue()
-                    
-                    def fetch_price():
-                        try:
-                            price_result = self._get_price_info(plan_code, datacenter, config_info)
-                            price_queue.put(price_result)
-                        except Exception as e:
-                            self.add_log("WARNING", f"价格获取线程异常: {str(e)}", "monitor")
-                            price_queue.put(None)
-                    
-                    # 启动价格获取线程
-                    price_thread = threading.Thread(target=fetch_price, daemon=True)
-                    price_thread.start()
-                    price_thread.join(timeout=30.0)  # 最多等待30秒
-                    
-                    if price_thread.is_alive():
-                        # 如果线程还在运行，说明超时了
-                        self.add_log("WARNING", f"价格获取超时（30秒），发送不带价格的通知", "monitor")
-                        price_text = None
-                    else:
-                        # 尝试获取结果（如果线程完成）
-                        try:
-                            price_text = price_queue.get_nowait()
-                        except queue.Empty:
-                            price_text = None
-                    
+                
+                # 如果config_info中包含缓存的价格，直接使用
+                if config_info and "cached_price" in config_info:
+                    price_text = config_info.get("cached_price")
                     if price_text:
-                        message += f"\n💰 价格: {price_text}\n"
-                    else:
-                        # 如果价格获取失败，记录警告但继续发送通知
-                        self.add_log("WARNING", f"价格获取失败或超时，通知中不包含价格信息", "monitor")
-                except Exception as e:
-                    self.add_log("WARNING", f"价格获取过程异常: {str(e)}，发送不带价格的通知", "monitor")
-                    import traceback
-                    self.add_log("WARNING", f"价格获取异常详情: {traceback.format_exc()}", "monitor")
+                        self.add_log("DEBUG", f"使用缓存的价格: {price_text}", "monitor")
+                
+                # 如果没有缓存的价格，才去查询
+                if not price_text:
+                    try:
+                        import threading
+                        import queue
+                        price_queue = queue.Queue()
+                        
+                        def fetch_price():
+                            try:
+                                price_result = self._get_price_info(plan_code, datacenter, config_info)
+                                price_queue.put(price_result)
+                            except Exception as e:
+                                self.add_log("WARNING", f"价格获取线程异常: {str(e)}", "monitor")
+                                price_queue.put(None)
+                        
+                        # 启动价格获取线程
+                        price_thread = threading.Thread(target=fetch_price, daemon=True)
+                        price_thread.start()
+                        price_thread.join(timeout=30.0)  # 最多等待30秒
+                        
+                        if price_thread.is_alive():
+                            # 如果线程还在运行，说明超时了
+                            self.add_log("WARNING", f"价格获取超时（30秒），发送不带价格的通知", "monitor")
+                            price_text = None
+                        else:
+                            # 尝试获取结果（如果线程完成）
+                            try:
+                                price_text = price_queue.get_nowait()
+                            except queue.Empty:
+                                price_text = None
+                        
+                        if not price_text:
+                            # 如果价格获取失败，记录警告但继续发送通知
+                            self.add_log("WARNING", f"价格获取失败或超时，通知中不包含价格信息", "monitor")
+                    except Exception as e:
+                        self.add_log("WARNING", f"价格获取过程异常: {str(e)}，发送不带价格的通知", "monitor")
+                        import traceback
+                        self.add_log("WARNING", f"价格获取异常详情: {traceback.format_exc()}", "monitor")
+                
+                # 如果有价格信息，添加到消息中
+                if price_text:
+                    message += f"\n💰 价格: {price_text}\n"
                 
                 message += (
                     f"状态: {status}\n"
@@ -373,13 +495,75 @@ class ServerMonitor:
             self.add_log("ERROR", f"发送提醒时发生异常: {str(e)}", "monitor")
             self.add_log("ERROR", f"错误详情: {traceback.format_exc()}", "monitor")
     
-    def _get_price_info(self, plan_code, datacenter, config_info=None):
+    def _get_price_cache_key(self, plan_code, options):
         """
-        获取配置后的价格信息
+        生成价格缓存键
         
         Args:
             plan_code: 服务器型号
-            datacenter: 数据中心
+            options: 配置选项列表
+        
+        Returns:
+            str: 缓存键
+        """
+        # 对options进行排序以确保相同配置生成相同键
+        sorted_options = sorted(options) if options else []
+        return f"{plan_code}|{','.join(sorted_options)}"
+    
+    def _get_cached_price(self, plan_code, options):
+        """
+        从缓存中获取价格
+        
+        Args:
+            plan_code: 服务器型号
+            options: 配置选项列表
+        
+        Returns:
+            str or None: 缓存的价格文本，如果缓存不存在或过期返回None
+        """
+        cache_key = self._get_price_cache_key(plan_code, options)
+        
+        if cache_key in self.price_cache:
+            cached_data = self.price_cache[cache_key]
+            timestamp = cached_data.get("timestamp", 0)
+            current_time = time.time()
+            
+            # 检查缓存是否过期
+            if current_time - timestamp < self.price_cache_ttl:
+                price_text = cached_data.get("price")
+                age_hours = (current_time - timestamp) / 3600
+                self.add_log("DEBUG", f"使用缓存价格（已缓存 {age_hours:.1f} 小时）: {price_text}", "monitor")
+                return price_text
+            else:
+                # 缓存过期，删除
+                del self.price_cache[cache_key]
+                self.add_log("DEBUG", f"缓存已过期，删除: {cache_key}", "monitor")
+        
+        return None
+    
+    def _set_cached_price(self, plan_code, options, price_text):
+        """
+        将价格保存到缓存
+        
+        Args:
+            plan_code: 服务器型号
+            options: 配置选项列表
+            price_text: 价格文本
+        """
+        cache_key = self._get_price_cache_key(plan_code, options)
+        self.price_cache[cache_key] = {
+            "price": price_text,
+            "timestamp": time.time()
+        }
+        self.add_log("DEBUG", f"价格已缓存: {cache_key} = {price_text}", "monitor")
+    
+    def _get_price_info(self, plan_code, datacenter, config_info=None):
+        """
+        获取配置后的价格信息（带缓存支持）
+        
+        Args:
+            plan_code: 服务器型号
+            datacenter: 数据中心（用于查询，但不影响缓存键）
             config_info: 配置信息 {"memory": "xxx", "storage": "xxx", "display": "xxx", "options": [...]}
         
         Returns:
@@ -394,6 +578,12 @@ class ServerMonitor:
                 if 'options' in config_info and config_info['options']:
                     options = config_info['options']
             
+            # 先检查缓存
+            cached_price = self._get_cached_price(plan_code, options)
+            if cached_price:
+                return cached_price
+            
+            # 缓存不存在或过期，查询新价格
             # 使用HTTP请求调用内部价格API（确保在正确的上下文访问配置）
             import requests
             
@@ -426,6 +616,10 @@ class ServerMonitor:
                     currency_symbol = "€" if currency == "EUR" else "$" if currency == "USD" else currency
                     price_text = f"{currency_symbol}{with_tax:.2f}/月"
                     self.add_log("DEBUG", f"价格获取成功: {price_text}", "monitor")
+                    
+                    # 保存到缓存
+                    self._set_cached_price(plan_code, options, price_text)
+                    
                     return price_text
                 else:
                     self.add_log("WARNING", f"价格获取成功但withTax为None: result={result}", "monitor")
