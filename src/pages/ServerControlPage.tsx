@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { api } from "@/utils/apiClient";
 import { useToast } from "../components/ToastContainer";
-import { Server, RefreshCw, Power, HardDrive, X, AlertCircle, Activity, Cpu, Wifi, Calendar, Monitor, Mail, BarChart3, Check } from "lucide-react";
+import { Server, RefreshCw, Power, HardDrive, X, AlertCircle, Activity, Cpu, Wifi, Calendar, Monitor, Mail, BarChart3, Check, Cog } from "lucide-react";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
@@ -166,6 +166,11 @@ const ServerControlPage: React.FC = () => {
   const [hardware, setHardware] = useState<any>(null);
   const [loadingHardware, setLoadingHardware] = useState(false);
   
+  // BIOS 设置
+  const [biosSettings, setBiosSettings] = useState<any | null>(null);
+  const [biosSgx, setBiosSgx] = useState<any | null>(null);
+  const [loadingBios, setLoadingBios] = useState(false);
+  
   // Task 7: IP管理
   const [ips, setIps] = useState<any[]>([]);
   const [loadingIPs, setLoadingIPs] = useState(false);
@@ -223,6 +228,31 @@ const ServerControlPage: React.FC = () => {
   const [contactTech, setContactTech] = useState('');
   const [contactBilling, setContactBilling] = useState('');
   const [loadingChangeContact, setLoadingChangeContact] = useState(false);
+
+  // 加载 BIOS 设置
+  const fetchBiosSettings = async () => {
+    if (!selectedServer) return;
+    setLoadingBios(true);
+    setBiosSettings(null);
+    setBiosSgx(null);
+    try {
+      const resp = await api.get(`/server-control/${selectedServer.serviceName}/bios-settings`);
+      const data = resp.data?.bios ?? resp.data?.data ?? resp.data;
+      setBiosSettings(data);
+      // 尝试获取 SGX（如果不支持则忽略错误）
+      try {
+        const sgxResp = await api.get(`/server-control/${selectedServer.serviceName}/bios-settings/sgx`);
+        setBiosSgx(sgxResp.data?.sgx ?? sgxResp.data?.data ?? sgxResp.data);
+      } catch (_) {
+        setBiosSgx(null);
+      }
+    } catch (error: any) {
+      console.error('获取BIOS设置失败:', error);
+      showToast({ title: '获取BIOS设置失败', type: 'error' });
+    } finally {
+      setLoadingBios(false);
+    }
+  };
 
   // Task 1: 获取服务器列表（只显示活跃服务器）
   const fetchServers = async () => {
@@ -1507,6 +1537,13 @@ const ServerControlPage: React.FC = () => {
                     {loadingBootModes ? '加载中...' : '启动模式'}
                   </button>
                   <button
+                    onClick={fetchBiosSettings}
+                    disabled={loadingBios}
+                    className="px-4 py-2 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-yellow-400 hover:bg-yellow-500/20 transition-all flex items-center gap-2 justify-center disabled:opacity-50">
+                    <Cog className="w-4 h-4" />
+                    {loadingBios ? '加载中...' : 'BIOS 设置'}
+                  </button>
+                  <button
                     onClick={() => {
                       setHardwareReplaceType('');
                       setShowHardwareReplaceDialog(true);
@@ -1607,6 +1644,68 @@ const ServerControlPage: React.FC = () => {
                   </div>
                 ) : (
                   <p className="text-cyber-muted text-sm">暂无硬件信息</p>
+                )}
+              </div>
+
+              {/* BIOS 设置 */}
+              <div className="cyber-card">
+                <h3 className="text-lg font-semibold text-cyber-text mb-4 flex items-center gap-2">
+                  <Cog className="w-5 h-5 text-cyber-accent" />
+                  BIOS 设置
+                </h3>
+                {loadingBios ? (
+                  <div className="flex items-center gap-2 text-cyber-muted">
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    加载中...
+                  </div>
+                ) : biosSettings ? (
+                  <div className="space-y-4">
+                    <div className="text-sm">
+                      <div className="text-cyber-muted mb-2">当前 BIOS 配置</div>
+                      <div className="bg-cyber-grid/30 border border-cyber-accent/20 rounded-lg overflow-hidden">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="bg-cyber-grid/40">
+                              <th className="text-left px-3 py-2 text-cyber-muted font-normal">键</th>
+                              <th className="text-left px-3 py-2 text-cyber-muted font-normal">值</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {Object.entries(biosSettings).map(([key, value]) => (
+                              <tr key={key} className="border-t border-cyber-accent/10">
+                                <td className="px-3 py-2 text-cyber-text font-mono break-all">{key}</td>
+                                <td className="px-3 py-2 text-cyber-text break-words">
+                                  {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    {biosSgx && (
+                      <div className="text-sm">
+                        <div className="text-cyber-muted mb-2">SGX</div>
+                        <div className="bg-cyber-grid/30 border border-cyber-accent/20 rounded-lg overflow-hidden">
+                          <table className="w-full text-sm">
+                            <tbody>
+                              {Object.entries(biosSgx).map(([key, value]) => (
+                                <tr key={key} className="border-t border-cyber-accent/10">
+                                  <td className="px-3 py-2 text-cyber-text font-mono break-all w-48">{key}</td>
+                                  <td className="px-3 py-2 text-cyber-text break-words">
+                                    {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-cyber-muted text-sm">点击上方“BIOS 设置”加载信息</p>
                 )}
               </div>
 

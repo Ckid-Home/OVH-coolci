@@ -6121,6 +6121,50 @@ def get_network_interface_stats(service_name):
 
 # ==================== VPS 监控相关功能 ====================
 
+# ==================== BIOS 设置 ====================
+@app.route('/api/server-control/<path:service_name>/bios-settings', methods=['GET', 'OPTIONS'])
+def get_server_bios_settings(service_name):
+    """获取服务器 BIOS 设置"""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    client = get_ovh_client()
+    if not client:
+        return jsonify({"success": False, "error": "未配置OVH API密钥"}), 401
+
+    try:
+        add_log("INFO", f"[BIOS] 获取服务器 {service_name} BIOS 设置", "server_control")
+        bios = client.get(f'/dedicated/server/{service_name}/biosSettings')
+        return jsonify({
+            "success": True,
+            "bios": bios
+        })
+    except Exception as e:
+        add_log("ERROR", f"[BIOS] 获取BIOS设置失败: {str(e)}", "server_control")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/server-control/<path:service_name>/bios-settings/sgx', methods=['GET', 'OPTIONS'])
+def get_server_bios_settings_sgx(service_name):
+    """获取服务器 SGX BIOS 设置（如果支持）"""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    client = get_ovh_client()
+    if not client:
+        return jsonify({"success": False, "error": "未配置OVH API密钥"}), 401
+
+    try:
+        add_log("INFO", f"[BIOS] 获取服务器 {service_name} SGX BIOS 设置", "server_control")
+        sgx = client.get(f'/dedicated/server/{service_name}/biosSettings/sgx')
+        return jsonify({
+            "success": True,
+            "sgx": sgx
+        })
+    except Exception as e:
+        # 某些服务器不支持 SGX，返回 404 友好提示
+        add_log("WARNING", f"[BIOS] 服务器 {service_name} 不支持 SGX: {str(e)}", "server_control")
+        return jsonify({"success": False, "error": "SGX 不可用"}), 404
+
 def check_vps_datacenter_availability(plan_code, ovh_subsidiary="IE"):
     """
     检查VPS套餐的数据中心可用性
