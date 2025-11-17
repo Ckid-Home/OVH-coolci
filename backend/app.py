@@ -495,12 +495,14 @@ def check_server_availability_with_configs(plan_code):
                 if dc_name:
                     datacenters[dc_name] = availability
             
-            # 尝试查找匹配的API2选项代码（用于价格查询）
+            # 尝试查找匹配的API2选项代码（用于价格查询和下单）
             api2_options = []
             try:
                 # 使用standardize_config查找匹配的选项
                 memory_std = standardize_config(memory) if memory != "N/A" else None
                 storage_std = standardize_config(storage) if storage != "N/A" else None
+                
+                add_log("DEBUG", f"[配置监控] 提取选项: memory={memory} (标准化: {memory_std}), storage={storage} (标准化: {storage_std})", "monitor")
                 
                 if memory_std or storage_std:
                     # 查找catalog中匹配的选项
@@ -515,18 +517,28 @@ def check_server_availability_with_configs(plan_code):
                                 
                                 if family_name == "memory" and memory_std:
                                     for addon in addons:
-                                        if standardize_config(addon) == memory_std:
+                                        addon_std = standardize_config(addon)
+                                        if addon_std == memory_std:
                                             if addon not in api2_options:
                                                 api2_options.append(addon)
+                                                add_log("DEBUG", f"[配置监控] 匹配到内存选项: {addon} (标准化: {addon_std})", "monitor")
                                 
                                 elif family_name == "storage" and storage_std:
                                     for addon in addons:
-                                        if standardize_config(addon) == storage_std:
+                                        addon_std = standardize_config(addon)
+                                        if addon_std == storage_std:
                                             if addon not in api2_options:
                                                 api2_options.append(addon)
+                                                add_log("DEBUG", f"[配置监控] 匹配到存储选项: {addon} (标准化: {addon_std})", "monitor")
                             break  # 找到匹配的plan后退出
+                
+                if api2_options:
+                    add_log("INFO", f"[配置监控] 成功提取 {len(api2_options)} 个API2选项: {api2_options}", "monitor")
+                else:
+                    add_log("WARNING", f"[配置监控] 未能提取API2选项，memory_std={memory_std}, storage_std={storage_std}", "monitor")
             except Exception as e:
                 add_log("WARNING", f"[配置监控] 查找API2选项代码失败: {str(e)}", "monitor")
+                add_log("DEBUG", f"[配置监控] 错误详情: {traceback.format_exc()}", "monitor")
             
             result[config_key] = {
                 "memory": memory,
@@ -3035,6 +3047,10 @@ def process_telegram_order(plan_code, datacenter=None, quantity=1, options=None)
         for config_key, config_data in configs_to_order:
             config_options = config_data.get("options", [])
             dc_map = config_data.get("datacenters", {})
+            memory = config_data.get("memory", "N/A")
+            storage = config_data.get("storage", "N/A")
+            
+            add_log("INFO", f"[Telegram下单] 处理配置: memory={memory}, storage={storage}, options={config_options}, 数据中心数={len([dc for dc in datacenters_to_order if dc_map.get(dc) not in ['unavailable', 'unknown']])}", "telegram")
             
             for dc in datacenters_to_order:
                 # 检查该配置在该机房是否有货
@@ -3047,7 +3063,7 @@ def process_telegram_order(plan_code, datacenter=None, quantity=1, options=None)
                         "id": str(uuid.uuid4()),
                         "planCode": plan_code,
                         "datacenter": dc,
-                        "options": config_options,
+                        "options": config_options,  # 这里会带上硬件选项
                         "status": "running",
                         "createdAt": datetime.now().isoformat(),
                         "updatedAt": datetime.now().isoformat(),
@@ -3057,6 +3073,7 @@ def process_telegram_order(plan_code, datacenter=None, quantity=1, options=None)
                         "fromTelegram": True  # 标记来自Telegram
                     }
                     orders_to_create.append(queue_item)
+                    add_log("DEBUG", f"[Telegram下单] 创建订单项: planCode={plan_code}, datacenter={dc}, options={config_options}", "telegram")
         
         # 并发处理订单创建（每批10单）
         BATCH_SIZE = 10
