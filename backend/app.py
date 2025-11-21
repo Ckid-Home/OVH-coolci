@@ -8914,6 +8914,244 @@ def manual_check_vps(plan_code):
             "message": "获取VPS数据中心信息失败"
         }), 500
 
+# ==================== VPS 控制台 API ====================
+
+@app.route('/api/vps-console/list', methods=['GET', 'OPTIONS'])
+def get_vps_list():
+    """
+    获取VPS列表
+    API端点: GET /vps
+    文档: https://eu.api.ovh.com/console/?section=%2Fvps&branch=v1#GET
+    """
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key, X-Request-Time')
+        response.headers.add('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        return response, 200
+    
+    client = get_ovh_client()
+    if not client:
+        return jsonify({"success": False, "error": "未配置OVH API密钥"}), 401
+    
+    try:
+        from ovh_api_helper import get_global_helper
+        helper = get_global_helper(client, max_calls_per_second=10)
+        
+        # 获取VPS服务名称列表
+        try:
+            vps_services = helper.get('/vps')
+            add_log("INFO", f"获取VPS列表成功，共 {len(vps_services) if vps_services else 0} 个VPS", "vps_console")
+        except Exception as api_error:
+            add_log("ERROR", f"调用OVH API /vps 失败: {str(api_error)}", "vps_console")
+            # 如果API调用失败，返回空列表而不是错误
+            return jsonify({
+                "success": True,
+                "data": [],
+                "total": 0,
+                "message": "未找到VPS实例或API调用失败"
+            })
+        
+        # 如果没有VPS，直接返回空列表
+        if not vps_services or len(vps_services) == 0:
+            return jsonify({
+                "success": True,
+                "data": [],
+                "total": 0,
+                "message": "当前账户没有VPS实例"
+            })
+        
+        vps_list = []
+        for service_name in vps_services:
+            try:
+                # 获取每个VPS的基本信息
+                vps_info = helper.get(f'/vps/{service_name}')
+                
+                # 获取服务信息
+                try:
+                    service_info = helper.get(f'/vps/{service_name}/serviceInfos')
+                except:
+                    service_info = {}
+                
+                # 安全地获取嵌套数据
+                model_info = vps_info.get('model', {})
+                datacenter_info = vps_info.get('datacenter', {})
+                memory_info = vps_info.get('memory', {})
+                cpu_info = vps_info.get('cpu', {})
+                disk_info = vps_info.get('disk', {})
+                
+                vps_list.append({
+                    'serviceName': service_name,
+                    'displayName': vps_info.get('displayName') or vps_info.get('name') or service_name,
+                    'name': vps_info.get('name') or service_name,
+                    'state': vps_info.get('state', 'unknown'),
+                    'model': model_info.get('name') if isinstance(model_info, dict) else (model_info if model_info else 'N/A'),
+                    'datacenter': datacenter_info.get('longName') if isinstance(datacenter_info, dict) else (datacenter_info if datacenter_info else 'N/A'),
+                    'datacenterCode': datacenter_info.get('region') if isinstance(datacenter_info, dict) else 'N/A',
+                    'memory': memory_info.get('value') if isinstance(memory_info, dict) else (memory_info if memory_info else 0),
+                    'cpu': cpu_info.get('number') if isinstance(cpu_info, dict) else (cpu_info if cpu_info else 0),
+                    'disk': disk_info.get('value') if isinstance(disk_info, dict) else (disk_info if disk_info else 0),
+                    'ip': vps_info.get('ip', 'N/A'),
+                    'netbootMode': vps_info.get('netbootMode', 'N/A'),
+                    'osType': vps_info.get('osType', 'N/A'),
+                    'status': service_info.get('status', 'unknown') if isinstance(service_info, dict) else 'unknown',
+                    'creation': service_info.get('creation', '') if isinstance(service_info, dict) else '',
+                    'expiration': service_info.get('expiration', '') if isinstance(service_info, dict) else ''
+                })
+            except Exception as e:
+                add_log("WARNING", f"获取VPS {service_name} 信息失败: {str(e)}", "vps_console")
+                # 即使获取详情失败，也添加基本信息
+                vps_list.append({
+                    'serviceName': service_name,
+                    'displayName': service_name,
+                    'name': service_name,
+                    'state': 'unknown',
+                    'error': str(e)
+                })
+        
+        return jsonify({
+            "success": True,
+            "data": vps_list,
+            "total": len(vps_list)
+        })
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        add_log("ERROR", f"获取VPS列表失败: {str(e)}\n{error_trace}", "vps_console")
+        return jsonify({
+            "success": False, 
+            "error": str(e),
+            "message": "获取VPS列表时发生错误，请检查后端日志"
+        }), 500
+
+@app.route('/api/vps-console/<service_name>', methods=['GET', 'OPTIONS'])
+def get_vps_details(service_name):
+    """
+    获取VPS详细信息
+    API端点: GET /vps/{serviceName}
+    文档: https://eu.api.ovh.com/console/?section=%2Fvps&branch=v1#GET
+    """
+    if request.method == 'OPTIONS':
+        response = jsonify({})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key, X-Request-Time')
+        response.headers.add('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        return response, 200
+    
+    client = get_ovh_client()
+    if not client:
+        return jsonify({"success": False, "error": "未配置OVH API密钥"}), 401
+    
+    try:
+        from ovh_api_helper import get_global_helper
+        helper = get_global_helper(client, max_calls_per_second=10)
+        
+        # 获取VPS基本信息
+        try:
+            vps_info = helper.get(f'/vps/{service_name}')
+        except Exception as api_error:
+            add_log("ERROR", f"调用OVH API /vps/{service_name} 失败: {str(api_error)}", "vps_console")
+            return jsonify({
+                "success": False,
+                "error": f"获取VPS信息失败: {str(api_error)}"
+            }), 404
+        
+        # 获取服务信息
+        try:
+            service_info = helper.get(f'/vps/{service_name}/serviceInfos')
+        except:
+            service_info = {}
+        
+        # 获取IP地址
+        ipv4_list = []
+        ipv6_list = []
+        try:
+            ips = helper.get(f'/vps/{service_name}/ips')
+            if isinstance(ips, list):
+                for ip in ips:
+                    try:
+                        # IP可能是字符串格式，需要URL编码
+                        ip_encoded = ip.replace('/', '%2F')
+                        ip_detail = helper.get(f'/vps/{service_name}/ips/{ip_encoded}')
+                        if isinstance(ip_detail, dict):
+                            if ip_detail.get('version') == 4:
+                                ipv4_list.append(ip_detail.get('ip', ip))
+                            elif ip_detail.get('version') == 6:
+                                ipv6_list.append(ip_detail.get('ip', ip))
+                    except:
+                        # 如果获取IP详情失败，尝试直接使用IP
+                        if isinstance(ip, str):
+                            if ':' in ip:
+                                ipv6_list.append(ip)
+                            else:
+                                ipv4_list.append(ip)
+        except Exception as e:
+            add_log("WARNING", f"获取VPS {service_name} IP列表失败: {str(e)}", "vps_console")
+        
+        # 获取监控状态
+        monitoring = False
+        try:
+            monitoring_info = helper.get(f'/vps/{service_name}/monitoring')
+            monitoring = monitoring_info.get('enabled', False)
+        except:
+            pass
+        
+        # 获取快照数量
+        snapshot_count = 0
+        try:
+            snapshots = helper.get(f'/vps/{service_name}/snapshots')
+            snapshot_count = len(snapshots) if isinstance(snapshots, list) else 0
+        except:
+            pass
+        
+        # 安全地获取嵌套数据
+        model_info = vps_info.get('model', {})
+        datacenter_info = vps_info.get('datacenter', {})
+        memory_info = vps_info.get('memory', {})
+        cpu_info = vps_info.get('cpu', {})
+        disk_info = vps_info.get('disk', {})
+        renew_info = service_info.get('renew', {}) if isinstance(service_info, dict) else {}
+        
+        # 构建详细信息
+        details = {
+            'serviceName': service_name,
+            'displayName': vps_info.get('displayName') or vps_info.get('name') or service_name,
+            'name': vps_info.get('name') or service_name,
+            'state': vps_info.get('state', 'unknown'),
+            'model': model_info.get('name') if isinstance(model_info, dict) else (model_info if model_info else 'N/A'),
+            'datacenter': datacenter_info.get('longName') if isinstance(datacenter_info, dict) else (datacenter_info if datacenter_info else 'N/A'),
+            'datacenterCode': datacenter_info.get('region') if isinstance(datacenter_info, dict) else 'N/A',
+            'memory': memory_info.get('value') if isinstance(memory_info, dict) else (memory_info if memory_info else 0),
+            'cpu': cpu_info.get('number') if isinstance(cpu_info, dict) else (cpu_info if cpu_info else 0),
+            'disk': disk_info.get('value') if isinstance(disk_info, dict) else (disk_info if disk_info else 0),
+            'ip': vps_info.get('ip', 'N/A'),
+            'netbootMode': vps_info.get('netbootMode', 'N/A'),
+            'osType': vps_info.get('osType', 'N/A'),
+            'status': service_info.get('status', 'unknown') if isinstance(service_info, dict) else 'unknown',
+            'creation': service_info.get('creation', '') if isinstance(service_info, dict) else '',
+            'expiration': service_info.get('expiration', '') if isinstance(service_info, dict) else '',
+            'renewalType': renew_info.get('automatic', False) if isinstance(renew_info, dict) else False,
+            'ipv4': ipv4_list,
+            'ipv6': ipv6_list,
+            'monitoring': monitoring,
+            'snapshotCount': snapshot_count
+        }
+        
+        add_log("INFO", f"获取VPS {service_name} 详情成功", "vps_console")
+        return jsonify({
+            "success": True,
+            "data": details
+        })
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        add_log("ERROR", f"获取VPS {service_name} 详情失败: {str(e)}\n{error_trace}", "vps_console")
+        return jsonify({
+            "success": False, 
+            "error": str(e),
+            "message": f"获取VPS详情时发生错误，请检查后端日志"
+        }), 500
+
 # ==================== OVH 账户管理 API ====================
 
 @app.route('/api/ovh/account/info', methods=['GET'])

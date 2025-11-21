@@ -20,6 +20,7 @@ const Sidebar = ({ onToggle, isOpen }: SidebarProps) => {
     { path: "/queue", icon: "clipboard-list", label: "抢购队列" },
     { path: "/monitor", icon: "bell", label: "服务器监控" },
     { path: "/vps-monitor", icon: "cloud", label: "VPS补货通知" },
+    { path: "/vps-console", icon: "server", label: "VPS控制台" },
     { path: "/server-control", icon: "terminal", label: "服务器控制" },
     { path: "/account-management", icon: "user", label: "账户管理" },
     { path: "/history", icon: "clock", label: "抢购历史" },

@@ -1,12 +1,12 @@
 """
 OVH API Helper - 提供重试机制和限流功能
 解决 SSL 连接错误和 API 限流问题
+不依赖tenacity，使用手动实现的重试机制
 """
 
 import time
 import logging
 from threading import Lock
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 try:
     from requests.exceptions import SSLError, ConnectionError, Timeout
@@ -72,14 +72,9 @@ class OVHAPIHelper:
         self.total_requests = 0
         self.failed_requests = 0
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((SSLError, ConnectionError, Timeout, OSError)),
-    )
     def _call_with_retry(self, method, path, **params):
         """
-        带重试机制的 API 调用
+        带重试机制的 API 调用（手动实现，不依赖tenacity）
         
         Args:
             method: HTTP 方法 (GET, POST, PUT, DELETE)
@@ -89,51 +84,66 @@ class OVHAPIHelper:
         Returns:
             API 响应
         """
-        # 限流
-        self.rate_limiter.wait_if_needed()
-        self.total_requests += 1
+        max_retries = self.max_retries
+        last_exception = None
         
-        try:
-            method = method.upper()
-            
-            if method == 'GET':
-                result = self.client.get(path, **params)
-            elif method == 'POST':
-                result = self.client.post(path, **params)
-            elif method == 'PUT':
-                result = self.client.put(path, **params)
-            elif method == 'DELETE':
-                result = self.client.delete(path, **params)
-            else:
-                raise ValueError(f"不支持的 HTTP 方法: {method}")
-            
-            # 重置 SSL 错误计数
-            self.ssl_error_count = 0
-            return result
-            
-        except SSLError as e:
-            self.ssl_error_count += 1
-            self.failed_requests += 1
-            self.logger.warning(f"SSL 错误 (#{self.ssl_error_count}): {str(e)}")
-            
-            if self.ssl_error_count >= 5:
-                self.logger.error("⚠️ 连续 SSL 错误过多！请检查：")
-                self.logger.error("  1. 网络连接是否正常")
-                self.logger.error("  2. 防火墙/代理设置")
-                self.logger.error("  3. 系统时间是否准确")
-                self.logger.error("  4. SSL 证书是否过期")
-            
-            raise
-            
-        except (ConnectionError, Timeout) as e:
-            self.failed_requests += 1
-            self.logger.warning(f"网络错误: {str(e)}")
-            raise
-            
-        except Exception as e:
-            self.failed_requests += 1
-            self.logger.error(f"API 调用失败: {str(e)}")
-            raise
+        for attempt in range(max_retries):
+            try:
+                # 限流
+                self.rate_limiter.wait_if_needed()
+                self.total_requests += 1
+                
+                method = method.upper()
+                
+                if method == 'GET':
+                    result = self.client.get(path, **params)
+                elif method == 'POST':
+                    result = self.client.post(path, **params)
+                elif method == 'PUT':
+                    result = self.client.put(path, **params)
+                elif method == 'DELETE':
+                    result = self.client.delete(path, **params)
+                else:
+                    raise ValueError(f"不支持的 HTTP 方法: {method}")
+                
+                # 重置 SSL 错误计数
+                self.ssl_error_count = 0
+                return result
+                
+            except (SSLError, ConnectionError, Timeout, OSError) as e:
+                last_exception = e
+                self.failed_requests += 1
+                
+                # 如果是最后一次尝试，直接抛出异常
+                if attempt == max_retries - 1:
+                    if isinstance(e, SSLError):
+                        self.ssl_error_count += 1
+                        self.logger.warning(f"SSL 错误 (#{self.ssl_error_count}): {str(e)}")
+                        
+                        if self.ssl_error_count >= 5:
+                            self.logger.error("⚠️ 连续 SSL 错误过多！请检查：")
+                            self.logger.error("  1. 网络连接是否正常")
+                            self.logger.error("  2. 防火墙/代理设置")
+                            self.logger.error("  3. 系统时间是否准确")
+                            self.logger.error("  4. SSL 证书是否过期")
+                    else:
+                        self.logger.warning(f"网络错误: {str(e)}")
+                    raise
+                
+                # 等待后重试（指数退避）
+                wait_time = min(2 ** attempt, 10)
+                self.logger.debug(f"API调用失败，{wait_time}秒后重试 (尝试 {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                
+            except Exception as e:
+                # 其他异常不重试，直接抛出
+                self.failed_requests += 1
+                self.logger.error(f"API 调用失败: {str(e)}")
+                raise
+        
+        # 如果所有重试都失败，抛出最后一个异常
+        if last_exception:
+            raise last_exception
     
     def get(self, path, **params):
         """GET 请求"""
